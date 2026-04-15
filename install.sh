@@ -15,6 +15,8 @@ cd "$SCRIPT_DIR"
 # ── 1. System packages ──────────────────────────────────────
 echo "→ Installing system dependencies..."
 sudo apt-get update -qq
+
+# Core packages (universally available)
 sudo apt-get install -y -qq \
     python3-pip \
     python3-venv \
@@ -25,20 +27,14 @@ sudo apt-get install -y -qq \
     fonts-dejavu-core \
     git
 
-# Handle packages whose names vary across Debian versions
-for pkg in libtiff6 libtiff-dev; do
-    if apt-cache show "$pkg" &>/dev/null 2>&1; then
-        sudo apt-get install -y -qq "$pkg" && break
-    fi
-done
-
-# libatlas-base-dev was removed in Debian Trixie; install the replacement if needed
-if apt-cache show libatlas-base-dev &>/dev/null 2>&1; then
-    sudo apt-get install -y -qq libatlas-base-dev
-else
-    echo "  libatlas-base-dev not available (Trixie+), installing alternatives..."
-    sudo apt-get install -y -qq libblas-dev liblapack-dev 2>/dev/null || true
-fi
+# These packages have different names across Debian versions.
+# Try each one; failures are OK.
+set +e
+sudo apt-get install -y -qq libtiff6 2>/dev/null
+sudo apt-get install -y -qq libtiff-dev 2>/dev/null
+sudo apt-get install -y -qq libblas-dev liblapack-dev 2>/dev/null
+sudo apt-get install -y -qq libatlas-base-dev 2>/dev/null
+set -e
 
 # ── 2. Enable SPI (if not already) ──────────────────────────
 echo "→ Checking SPI..."
