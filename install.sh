@@ -22,10 +22,23 @@ sudo apt-get install -y -qq \
     python3-pil \
     python3-numpy \
     libopenjp2-7 \
-    libtiff6 \
-    libatlas-base-dev \
     fonts-dejavu-core \
     git
+
+# Handle packages whose names vary across Debian versions
+for pkg in libtiff6 libtiff-dev; do
+    if apt-cache show "$pkg" &>/dev/null 2>&1; then
+        sudo apt-get install -y -qq "$pkg" && break
+    fi
+done
+
+# libatlas-base-dev was removed in Debian Trixie; install the replacement if needed
+if apt-cache show libatlas-base-dev &>/dev/null 2>&1; then
+    sudo apt-get install -y -qq libatlas-base-dev
+else
+    echo "  libatlas-base-dev not available (Trixie+), installing alternatives..."
+    sudo apt-get install -y -qq libblas-dev liblapack-dev 2>/dev/null || true
+fi
 
 # ── 2. Enable SPI (if not already) ──────────────────────────
 echo "→ Checking SPI..."
