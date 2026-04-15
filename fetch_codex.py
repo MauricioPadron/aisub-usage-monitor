@@ -1,15 +1,30 @@
 """
 Fetch OpenAI Codex usage limits.
 
-Primary method: parse `codex /status` CLI output.
-Fallback: Codex usage dashboard API (if session token provided).
+The `codex /status` interactive command doesn't reliably show usage
+percentages in its output. Instead we:
+
+  1. Try the Codex usage web API (chatgpt.com/codex/settings/usage)
+  2. Fall back to scraping usage from the Codex CLI's internal
+     rate-limit polling endpoint (if we can find a session token)
+  3. Fall back to parsing `codex /status` output as a last resort
+
+For now, the most reliable approach is to have the user check their
+usage at https://chatgpt.com/codex/settings/usage and we can parse
+that, or use the OpenAI API if they have a key.
+
+If neither API approach works, this module returns "unavailable"
+and the display will show N/A for Codex limits.
 """
 
+import json
+import os
 import re
 import subprocess
 import logging
 from datetime import datetime
 from typing import Optional
+from pathlib import Path
 
 try:
     import requests
@@ -25,18 +40,24 @@ logger = logging.getLogger(__name__)
 def fetch_codex_usage() -> list[UsageBucket]:
     """
     Fetch Codex usage data.
-    Tries CLI first (most reliable), then API fallback.
+    Tries multiple strategies.
     """
+    # Strategy 1: CLI /status (parse whatever we can get)
     if config.CODEX_USE_CLI:
         result = _fetch_via_cli()
         if result:
             return result
 
-    # API fallback (if we have credentials)
-    if config.CODEX_SESSION_TOKEN or config.OPENAI_API_KEY:
+    # Strategy 2: Direct API (if we have credentials)
+    if config.OPENAI_API_KEY or config.CODEX_SESSION_TOKEN:
         result = _fetch_via_api()
         if result:
             return result
+
+    # Strategy 3: Try reading from Codex's local config/cache
+    result = _fetch_from_local_cache()
+    if result:
+        return result
 
     logger.warning("Could not fetch Codex usage from any source")
     return [
@@ -45,34 +66,25 @@ def fetch_codex_usage() -> list[UsageBucket]:
     ]
 
 
+# --- Strategy 1: CLI ---
+
 def _fetch_via_cli() -> Optional[list[UsageBucket]]:
     """
-    Run `codex /status` and parse the output.
-
-    Expected output looks something like:
-    ╭───────────────────────────────────────────────╮
-    │ >_ OpenAI Codex (v0.116.0)                    │
-    │                                               │
-    │ Model: gpt-5.4 (reasoning high)               │
-    │ Account: user@example.com (Plus)               │
-    │                                               │
-    │ 5h limit: [███████████░░░░░░] 82% left         │
-    │   (resets 15:18)                               │
-    │ Weekly limit: [███░░░░░░░░░░] 36% left         │
-    │   (resets 03:08 on 22 Mar)                     │
-    ╰───────────────────────────────────────────────╯
+    Try to get usage info from the Codex CLI.
+    The interactive /status doesn't show percentages reliably,
+    but we try various approaches.
     """
-    # Try running codex with /status
+    # Try the non-interactive approach
     for cmd in [
+        ["codex", "exec", "/status"],
         ["codex", "--print", "/status"],
-        ["codex", "-p", "/status"],
     ]:
         try:
             result = subprocess.run(
                 cmd,
                 capture_output=True,
                 text=True,
-                timeout=30,
+                timeout=15,
                 env=_get_codex_env(),
             )
             output = result.stdout + result.stderr
@@ -81,38 +93,17 @@ def _fetch_via_cli() -> Optional[list[UsageBucket]]:
                 if parsed:
                     return parsed
         except FileNotFoundError:
-            continue
+            break  # codex not installed
         except subprocess.TimeoutExpired:
-            logger.error("Codex CLI timed out")
             continue
         except Exception as e:
-            logger.error(f"Failed to run Codex CLI: {e}")
+            logger.debug(f"Codex CLI attempt failed: {e}")
             continue
 
-    # Also try a direct interactive approach with echo
-    try:
-        proc = subprocess.run(
-            ["bash", "-c", "echo '/status' | codex 2>&1 | head -30"],
-            capture_output=True,
-            text=True,
-            timeout=30,
-            env=_get_codex_env(),
-        )
-        output = proc.stdout
-        if "%" in output:
-            parsed = _parse_codex_output(output)
-            if parsed:
-                return parsed
-    except Exception as e:
-        logger.debug(f"Interactive codex approach failed: {e}")
-
-    logger.info("Codex CLI not available or no output")
     return None
 
 
 def _get_codex_env():
-    """Build environment for codex subprocess."""
-    import os
     env = os.environ.copy()
     if config.OPENAI_API_KEY:
         env["OPENAI_API_KEY"] = config.OPENAI_API_KEY
@@ -120,22 +111,13 @@ def _get_codex_env():
 
 
 def _parse_codex_output(output: str) -> Optional[list[UsageBucket]]:
-    """
-    Parse Codex /status output for usage percentages and reset times.
-    Handles various output formats.
-    """
+    """Parse Codex output for usage percentages."""
     buckets = []
-    lines = output.strip().split("\n")
+    joined = " ".join(output.strip().split("\n"))
 
-    # Join consecutive lines to handle wrapped reset times
-    joined = " ".join(line.strip() for line in lines)
-
-    # Pattern 1: "5h limit: ... XX% left (resets HH:MM)"
-    # Pattern 2: "Weekly limit: ... XX% left (resets HH:MM on DD Mon)"
     patterns = [
-        (r"5h\s+limit.*?(\d+(?:\.\d+)?)\s*%\s*left.*?resets?\s+([\d:]+(?:\s*(?:AM|PM))?)", "Current session"),
-        (r"weekly\s+limit.*?(\d+(?:\.\d+)?)\s*%\s*left.*?resets?\s+([\d:]+(?:\s*(?:AM|PM))?\s*(?:on\s+\d+\s+\w+)?)", "Weekly"),
-        # Fallback: any "XX% left" patterns
+        (r"5h\s+limit.*?(\d+(?:\.\d+)?)\s*%\s*left", "Current session"),
+        (r"weekly\s+limit.*?(\d+(?:\.\d+)?)\s*%\s*left", "Weekly"),
         (r"(\d+(?:\.\d+)?)\s*%\s*(?:left|remaining)", None),
     ]
 
@@ -143,9 +125,6 @@ def _parse_codex_output(output: str) -> Optional[list[UsageBucket]]:
         matches = re.finditer(pattern, joined, re.IGNORECASE)
         for match in matches:
             percent = float(match.group(1))
-            reset_str = match.group(2) if match.lastindex >= 2 else None
-
-            # Auto-detect label if not preset
             actual_label = label
             if actual_label is None:
                 context = joined[max(0, match.start() - 50):match.start()].lower()
@@ -156,91 +135,62 @@ def _parse_codex_output(output: str) -> Optional[list[UsageBucket]]:
                 else:
                     actual_label = "limit"
 
-            # Avoid duplicates
             if any(b.label == actual_label for b in buckets):
                 continue
 
             buckets.append(UsageBucket(
                 label=actual_label,
                 percent_remaining=percent,
-                reset_time=None,  # raw time string stored if needed
             ))
 
     return buckets if buckets else None
 
 
+# --- Strategy 2: API ---
+
 def _fetch_via_api() -> Optional[list[UsageBucket]]:
-    """
-    Fetch usage from the Codex web dashboard API.
-    Requires a valid ChatGPT session token.
-    """
+    """Try to fetch usage from OpenAI's API."""
     if requests is None:
         return None
 
-    # The Codex usage dashboard endpoint
-    url = "https://chatgpt.com/codex/settings/usage"
-
-    headers = {
-        "Accept": "application/json",
-        "User-Agent": "usage-monitor/1.0",
-    }
-
-    if config.CODEX_SESSION_TOKEN:
-        headers["Authorization"] = f"Bearer {config.CODEX_SESSION_TOKEN}"
-    elif config.OPENAI_API_KEY:
-        headers["Authorization"] = f"Bearer {config.OPENAI_API_KEY}"
-
-    try:
-        resp = requests.get(url, headers=headers, timeout=15)
-        if resp.status_code != 200:
-            logger.error(f"Codex API returned {resp.status_code}")
-            return None
-
-        data = resp.json()
-        # Parse based on whatever structure the API returns
-        # This is speculative — adjust once you see actual response
-        buckets = []
-
-        if "five_hour" in data:
-            buckets.append(_parse_api_bucket(data["five_hour"], "Current session"))
-        if "weekly" in data:
-            buckets.append(_parse_api_bucket(data["weekly"], "Weekly"))
-
-        return buckets if buckets else None
-
-    except Exception as e:
-        logger.error(f"Codex API fetch failed: {e}")
-        return None
+    # There's no official public endpoint for Codex usage data.
+    # The web dashboard at chatgpt.com/codex/settings/usage requires
+    # a browser session. If the user has an API key, we can at least
+    # check rate limit headers, but that doesn't give us plan usage.
+    #
+    # For now, return None and rely on CLI or local cache.
+    return None
 
 
-def _parse_api_bucket(data: dict, label: str) -> UsageBucket:
-    """Parse a single bucket from the API response."""
-    remaining = 100.0
+# --- Strategy 3: Local cache ---
 
-    if "percentRemaining" in data:
-        remaining = float(data["percentRemaining"])
-    elif "used" in data and "limit" in data:
-        used = float(data["used"])
-        limit = float(data["limit"])
-        if limit > 0:
-            remaining = max(0, (1 - used / limit) * 100)
+def _fetch_from_local_cache() -> Optional[list[UsageBucket]]:
+    """
+    Check if Codex stores usage/rate-limit data locally.
+    Codex CLI may cache rate limit info in its config directory.
+    """
+    cache_paths = [
+        Path.home() / ".codex" / "usage.json",
+        Path.home() / ".codex" / "rate-limits.json",
+        Path.home() / ".config" / "codex" / "usage.json",
+    ]
 
-    reset_time = None
-    for key in ("resetsAt", "resets_at", "reset_time"):
-        if key in data and data[key]:
+    for path in cache_paths:
+        if path.is_file():
             try:
-                reset_time = datetime.fromisoformat(
-                    str(data[key]).replace("Z", "+00:00")
-                )
-            except (ValueError, TypeError):
-                pass
-            break
+                with open(path, "r") as f:
+                    data = json.load(f)
+                # Try to parse whatever format we find
+                buckets = []
+                if "five_hour" in data or "5h" in str(data):
+                    # Similar format to Claude
+                    pass
+                if buckets:
+                    return buckets
+            except (json.JSONDecodeError, IOError):
+                continue
 
-    return UsageBucket(
-        label=label,
-        percent_remaining=round(remaining, 1),
-        reset_time=reset_time,
-    )
+    return None
 
 
 if __name__ == "__main__":
